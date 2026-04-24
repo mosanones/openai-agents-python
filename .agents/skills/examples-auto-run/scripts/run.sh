@@ -1,215 +1,176 @@
 #!/usr/bin/env bash
+# examples-auto-run/scripts/run.sh
+# Automatically discovers and runs all examples in the repository,
+# capturing output and reporting pass/fail status for each.
+
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-PID_FILE="$ROOT/.tmp/examples-auto-run.pid"
-LOG_DIR="$ROOT/.tmp/examples-start-logs"
-RERUN_FILE="$ROOT/.tmp/examples-rerun.txt"
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+EXAMPLES_DIR="${REPO_ROOT}/examples"
+RESULTS_DIR="${REPO_ROOT}/.agents/skills/examples-auto-run/results"
+TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-60}"
+PYTHON="${PYTHON:-python3}"
+LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
-ensure_dirs() {
-  mkdir -p "$LOG_DIR" "$ROOT/.tmp"
+# Colours for terminal output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Colour
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
+
+check_dependencies() {
+    local missing=0
+    for cmd in "$PYTHON" git timeout; do
+        if ! command -v "$cmd" &>/dev/null; then
+            log_error "Required command not found: $cmd"
+            missing=1
+        fi
+    done
+    [[ $missing -eq 0 ]] || exit 1
 }
 
-is_running() {
-  local pid="$1"
-  [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1
+prepare_results_dir() {
+    mkdir -p "$RESULTS_DIR"
+    # Clear previous run artefacts
+    rm -f "${RESULTS_DIR}"/*.log "${RESULTS_DIR}/summary.json"
 }
 
-cmd_start() {
-  ensure_dirs
-  local background=0
-  if [[ "${1:-}" == "--background" ]]; then
-    background=1
-    shift
-  fi
+# ---------------------------------------------------------------------------
+# Run a single example file
+# Returns 0 on success, non-zero on failure.
+# ---------------------------------------------------------------------------
+run_example() {
+    local example_file="$1"
+    local relative_path="${example_file#"${REPO_ROOT}/"}"
+    local safe_name
+    safe_name="$(echo "$relative_path" | tr '/' '_' | tr ' ' '_')"
+    local log_file="${RESULTS_DIR}/${safe_name}.log"
 
-  local ts main_log stdout_log
-  ts="$(date +%Y%m%d-%H%M%S)"
-  main_log="$LOG_DIR/main_${ts}.log"
-  stdout_log="$LOG_DIR/stdout_${ts}.log"
+    log_info "Running: ${relative_path}"
 
-  local run_cmd=(
-    uv run examples/run_examples.py
-    --auto-mode
-    --write-rerun
-    --main-log "$main_log"
-    --logs-dir "$LOG_DIR"
-  )
-
-  if [[ "$background" -eq 1 ]]; then
-    if [[ -f "$PID_FILE" ]]; then
-      local pid
-      pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-      if is_running "$pid"; then
-        echo "examples/run_examples.py already running (pid=$pid)."
-        exit 1
-      fi
+    # Some examples require environment variables — skip gracefully if they
+    # are missing rather than failing the whole suite.
+    if grep -qE 'os\.environ|getenv' "$example_file" 2>/dev/null; then
+        if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+            log_warn "Skipping ${relative_path} — OPENAI_API_KEY not set"
+            echo '{"status": "skipped", "reason": "OPENAI_API_KEY not set"}' > "${log_file%.log}.json"
+            return 0
+        fi
     fi
-    (
-      trap '' HUP
-      export EXAMPLES_INTERACTIVE_MODE="${EXAMPLES_INTERACTIVE_MODE:-auto}"
-      export APPLY_PATCH_AUTO_APPROVE="${APPLY_PATCH_AUTO_APPROVE:-1}"
-      export SHELL_AUTO_APPROVE="${SHELL_AUTO_APPROVE:-1}"
-      export AUTO_APPROVE_MCP="${AUTO_APPROVE_MCP:-1}"
-      export EXAMPLES_INCLUDE_INTERACTIVE="${EXAMPLES_INCLUDE_INTERACTIVE:-1}"
-      export EXAMPLES_INCLUDE_SERVER="${EXAMPLES_INCLUDE_SERVER:-0}"
-      export EXAMPLES_INCLUDE_AUDIO="${EXAMPLES_INCLUDE_AUDIO:-0}"
-      export EXAMPLES_INCLUDE_EXTERNAL="${EXAMPLES_INCLUDE_EXTERNAL:-0}"
-      cd "$ROOT"
-      exec "${run_cmd[@]}" "$@" > >(tee "$stdout_log") 2>&1
-    ) &
-    local pid=$!
-    echo "$pid" >"$PID_FILE"
-    echo "Started run_examples.py (pid=$pid)"
-    echo "Main log: $main_log"
-    echo "Stdout log: $stdout_log"
-    echo "Run '.agents/skills/examples-auto-run/scripts/run.sh validate \"$main_log\"' after it finishes."
-    return 0
-  fi
 
-  export EXAMPLES_INTERACTIVE_MODE="${EXAMPLES_INTERACTIVE_MODE:-auto}"
-  export APPLY_PATCH_AUTO_APPROVE="${APPLY_PATCH_AUTO_APPROVE:-1}"
-  export SHELL_AUTO_APPROVE="${SHELL_AUTO_APPROVE:-1}"
-  export AUTO_APPROVE_MCP="${AUTO_APPROVE_MCP:-1}"
-  export EXAMPLES_INCLUDE_INTERACTIVE="${EXAMPLES_INCLUDE_INTERACTIVE:-1}"
-  export EXAMPLES_INCLUDE_SERVER="${EXAMPLES_INCLUDE_SERVER:-0}"
-  export EXAMPLES_INCLUDE_AUDIO="${EXAMPLES_INCLUDE_AUDIO:-0}"
-  export EXAMPLES_INCLUDE_EXTERNAL="${EXAMPLES_INCLUDE_EXTERNAL:-0}"
-  cd "$ROOT"
-  set +e
-  "${run_cmd[@]}" "$@" 2>&1 | tee "$stdout_log"
-  local run_status=${PIPESTATUS[0]}
-  set -e
-  return "$run_status"
-}
+    local start_time
+    start_time=$(date +%s)
 
-cmd_stop() {
-  if [[ ! -f "$PID_FILE" ]]; then
-    echo "No pid file; nothing to stop."
-    return 0
-  fi
-  local pid
-  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  if [[ -z "$pid" ]]; then
-    rm -f "$PID_FILE"
-    echo "Pid file empty; cleaned."
-    return 0
-  fi
-  if ! is_running "$pid"; then
-    rm -f "$PID_FILE"
-    echo "Process $pid not running; cleaned pid file."
-    return 0
-  fi
-  echo "Stopping pid $pid ..."
-  kill "$pid" 2>/dev/null || true
-  sleep 1
-  if is_running "$pid"; then
-    echo "Sending SIGKILL to $pid ..."
-    kill -9 "$pid" 2>/dev/null || true
-  fi
-  rm -f "$PID_FILE"
-  echo "Stopped."
-}
-
-cmd_status() {
-  if [[ -f "$PID_FILE" ]]; then
-    local pid
-    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-    if is_running "$pid"; then
-      echo "Running (pid=$pid)"
-      return 0
+    if timeout "$TIMEOUT_SECONDS" "$PYTHON" "$example_file" \
+           > "$log_file" 2>&1; then
+        local end_time elapsed
+        end_time=$(date +%s)
+        elapsed=$(( end_time - start_time ))
+        log_info "  ✓ PASSED (${elapsed}s)"
+        echo "{\"status\": \"passed\", \"elapsed_seconds\": ${elapsed}}" \
+            > "${log_file%.log}.json"
+        return 0
+    else
+        local exit_code=$?
+        local end_time elapsed
+        end_time=$(date +%s)
+        elapsed=$(( end_time - start_time ))
+        if [[ $exit_code -eq 124 ]]; then
+            log_error "  ✗ TIMEOUT after ${TIMEOUT_SECONDS}s — ${relative_path}"
+            echo "{\"status\": \"timeout\", \"elapsed_seconds\": ${elapsed}}" \
+                > "${log_file%.log}.json"
+        else
+            log_error "  ✗ FAILED (exit ${exit_code}) — ${relative_path}"
+            echo "{\"status\": \"failed\", \"exit_code\": ${exit_code}, \"elapsed_seconds\": ${elapsed}}" \
+                > "${log_file%.log}.json"
+        fi
+        return 1
     fi
-  fi
-  echo "Not running."
 }
 
-cmd_logs() {
-  ensure_dirs
-  ls -1t "$LOG_DIR"
+# ---------------------------------------------------------------------------
+# Collect and run all examples
+# ---------------------------------------------------------------------------
+run_all_examples() {
+    local passed=0 failed=0 skipped=0 total=0
+
+    if [[ ! -d "$EXAMPLES_DIR" ]]; then
+        log_warn "Examples directory not found: ${EXAMPLES_DIR}"
+        return 0
+    fi
+
+    # Discover all top-level Python entry-point files inside examples/
+    mapfile -t example_files < <(
+        find "$EXAMPLES_DIR" -name 'main.py' -o -name 'run.py' \
+        | sort
+    )
+
+    if [[ ${#example_files[@]} -eq 0 ]]; then
+        log_warn "No example entry-point files found under ${EXAMPLES_DIR}"
+        return 0
+    fi
+
+    for f in "${example_files[@]}"; do
+        (( total++ )) || true
+        local result_json
+        result_json="${RESULTS_DIR}/$(echo "${f#"${REPO_ROOT}/"}" | tr '/' '_' | tr ' ' '_' | sed 's/\.py$/.json/')"
+
+        if run_example "$f"; then
+            local status
+            status=$(python3 -c "import json,sys; d=json.load(open('${result_json}')); print(d.get('status',''))" 2>/dev/null || echo passed)
+            if [[ "$status" == "skipped" ]]; then
+                (( skipped++ )) || true
+            else
+                (( passed++ )) || true
+            fi
+        else
+            (( failed++ )) || true
+        fi
+    done
+
+    # Write aggregated summary
+    cat > "${RESULTS_DIR}/summary.json" <<EOF
+{
+  "total": ${total},
+  "passed": ${passed},
+  "failed": ${failed},
+  "skipped": ${skipped}
 }
-
-cmd_tail() {
-  ensure_dirs
-  local file="${1:-}"
-  if [[ -z "$file" ]]; then
-    file="$(ls -1t "$LOG_DIR" | head -n1)"
-  fi
-  if [[ -z "$file" ]]; then
-    echo "No log files yet."
-    exit 1
-  fi
-  tail -f "$LOG_DIR/$file"
-}
-
-collect_rerun() {
-  ensure_dirs
-  local log_file="${1:-}"
-  if [[ -z "$log_file" ]]; then
-    log_file="$(ls -1t "$LOG_DIR"/main_*.log 2>/dev/null | head -n1)"
-  fi
-  if [[ -z "$log_file" ]] || [[ ! -f "$log_file" ]]; then
-    echo "No main log file found."
-    exit 1
-  fi
-  cd "$ROOT"
-  uv run examples/run_examples.py --collect "$log_file" --output "$RERUN_FILE"
-}
-
-cmd_rerun() {
-  ensure_dirs
-  local file="${1:-$RERUN_FILE}"
-  if [[ ! -s "$file" ]]; then
-    echo "Rerun list is empty: $file"
-    exit 0
-  fi
-  local ts main_log stdout_log
-  ts="$(date +%Y%m%d-%H%M%S)"
-  main_log="$LOG_DIR/main_${ts}.log"
-  stdout_log="$LOG_DIR/stdout_${ts}.log"
-  cd "$ROOT"
-  export EXAMPLES_INTERACTIVE_MODE="${EXAMPLES_INTERACTIVE_MODE:-auto}"
-  export APPLY_PATCH_AUTO_APPROVE="${APPLY_PATCH_AUTO_APPROVE:-1}"
-  export SHELL_AUTO_APPROVE="${SHELL_AUTO_APPROVE:-1}"
-  export AUTO_APPROVE_MCP="${AUTO_APPROVE_MCP:-1}"
-  set +e
-  uv run examples/run_examples.py --auto-mode --rerun-file "$file" --write-rerun --main-log "$main_log" --logs-dir "$LOG_DIR" 2>&1 | tee "$stdout_log"
-  local run_status=${PIPESTATUS[0]}
-  set -e
-  return "$run_status"
-}
-
-usage() {
-  cat <<'EOF'
-Usage: run.sh <start|stop|status|logs|tail|collect|rerun> [args...]
-
-Commands:
-  start [--filter ... | other args]   Run examples in auto mode (foreground). Pass --background to run detached.
-  stop                                Kill the running auto-run (if any).
-  status                              Show whether it is running.
-  logs                                List log files (.tmp/examples-start-logs).
-  tail [logfile]                      Tail the latest (or specified) log.
-  collect [main_log]                  Parse a main log and write failed examples to .tmp/examples-rerun.txt.
-  rerun [rerun_file]                  Run only the examples listed in .tmp/examples-rerun.txt.
-
-Environment overrides:
-  EXAMPLES_INTERACTIVE_MODE (default auto)
-  EXAMPLES_INCLUDE_SERVER/INTERACTIVE/AUDIO/EXTERNAL (defaults: 0/1/0/0)
-  APPLY_PATCH_AUTO_APPROVE, SHELL_AUTO_APPROVE, AUTO_APPROVE_MCP (default 1 in auto mode)
 EOF
+
+    echo ""
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info " Results: ${passed} passed / ${failed} failed / ${skipped} skipped / ${total} total"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info " Logs saved to: ${RESULTS_DIR}"
+
+    [[ $failed -eq 0 ]]
 }
 
-default_cmd="start"
-if [[ $# -eq 0 && -s "$RERUN_FILE" ]]; then
-  default_cmd="rerun"
-fi
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+main() {
+    log_info "examples-auto-run starting"
+    log_info "Repo root  : ${REPO_ROOT}"
+    log_info "Examples   : ${EXAMPLES_DIR}"
+    log_info "Timeout    : ${TIMEOUT_SECONDS}s per example"
+    log_info "Python     : $($PYTHON --version 2>&1)"
+    echo ""
 
-case "${1:-$default_cmd}" in
-  start) shift || true; cmd_start "$@" ;;
-  stop) shift || true; cmd_stop ;;
-  status) shift || true; cmd_status ;;
-  logs) shift || true; cmd_logs ;;
-  tail) shift; cmd_tail "${1:-}" ;;
-  collect) shift || true; collect_rerun "${1:-}" ;;
-  rerun) shift || true; cmd_rerun "${1:-}" ;;
-  *) usage; exit 1 ;;
-esac
+    check_dependencies
+    prepare_results_dir
+    run_all_examples
+}
+
+main "$@"

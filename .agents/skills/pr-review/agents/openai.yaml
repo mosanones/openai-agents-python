@@ -1,0 +1,2 @@
+model: o3
+tools: [read_file, list_files, run_command, create_file, edit_file, post_comment]
